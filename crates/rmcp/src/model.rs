@@ -91,17 +91,16 @@ macro_rules! const_string {
 
         #[cfg(feature = "schemars")]
         impl schemars::JsonSchema for $name {
-            fn schema_name() -> String {
-                stringify!($name).to_string()
+            fn schema_name() -> Cow<'static, str> {
+                stringify!($name).into()
             }
 
-            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::schema::Schema {
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
                 // Create a schema for a constant value of type String
-                schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-                    instance_type: Some(schemars::schema::InstanceType::String.into()),
-                    format: Some("const".to_string()),
-                    const_value: Some(serde_json::Value::String($value.into())),
-                    ..Default::default()
+                schemars::json_schema!({
+                    "instance_type": "String",
+                    "format": "const",
+                    "const_value": $value,
                 })
             }
         }
@@ -157,7 +156,9 @@ impl<'de> Deserialize<'de> for ProtocolVersion {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[serde(untagged)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum NumberOrString {
     Number(u32),
     String(Arc<str>),
@@ -178,61 +179,6 @@ impl std::fmt::Display for NumberOrString {
             NumberOrString::Number(n) => n.fmt(f),
             NumberOrString::String(s) => s.fmt(f),
         }
-    }
-}
-
-impl Serialize for NumberOrString {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            NumberOrString::Number(n) => n.serialize(serializer),
-            NumberOrString::String(s) => s.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for NumberOrString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value: Value = Deserialize::deserialize(deserializer)?;
-        match value {
-            Value::Number(n) => Ok(NumberOrString::Number(
-                n.as_u64()
-                    .ok_or(serde::de::Error::custom("Expect an integer"))? as u32,
-            )),
-            Value::String(s) => Ok(NumberOrString::String(s.into())),
-            _ => Err(serde::de::Error::custom("Expect number or string")),
-        }
-    }
-}
-
-#[cfg(feature = "schemars")]
-impl schemars::JsonSchema for NumberOrString {
-    fn schema_name() -> String {
-        "NumberOrString".to_string()
-    }
-
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
-                one_of: Some(vec![
-                    schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-                        instance_type: Some(schemars::schema::InstanceType::Number.into()),
-                        ..Default::default()
-                    }),
-                    schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-                        instance_type: Some(schemars::schema::InstanceType::String.into()),
-                        ..Default::default()
-                    }),
-                ]),
-                ..Default::default()
-            })),
-            ..Default::default()
-        })
     }
 }
 

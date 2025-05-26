@@ -14,12 +14,12 @@ use crate::{
 };
 /// A shortcut for generating a JSON schema for a type.
 pub fn schema_for_type<T: JsonSchema>() -> JsonObject {
-    let mut settings = schemars::r#gen::SchemaSettings::default();
+    let mut settings = schemars::generate::SchemaSettings::default();
     settings.option_nullable = true;
     settings.option_add_null_type = false;
     settings.definitions_path = "#/components/schemas/".to_owned();
     settings.meta_schema = None;
-    settings.visitors = Vec::default();
+    // settings.visitors = Vec::default();
     settings.inline_subschemas = false;
     let generator = settings.into_generator();
     let schema = generator.into_root_schema_for::<T>();
@@ -180,11 +180,11 @@ pub struct Parameter<K: ConstString, V>(pub K, pub V);
 pub struct Parameters<P>(pub P);
 
 impl<P: JsonSchema> JsonSchema for Parameters<P> {
-    fn schema_name() -> String {
+    fn schema_name() -> Cow<'static, str> {
         P::schema_name()
     }
 
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
         P::json_schema(generator)
     }
 }
