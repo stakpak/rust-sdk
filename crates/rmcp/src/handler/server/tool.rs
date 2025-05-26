@@ -17,7 +17,7 @@ pub fn schema_for_type<T: JsonSchema>() -> JsonObject {
     let mut settings = schemars::generate::SchemaSettings::default();
     settings.option_nullable = true;
     settings.option_add_null_type = false;
-    settings.definitions_path = "#/components/schemas/".to_owned();
+    settings.definitions_path = "#/components/schemas/".into();
     settings.meta_schema = None;
     // settings.visitors = Vec::default();
     settings.inline_subschemas = false;
