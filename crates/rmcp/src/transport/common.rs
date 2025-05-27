@@ -2,7 +2,7 @@
     feature = "transport-streamable-http-server",
     feature = "transport-sse-server"
 ))]
-pub mod axum;
+pub mod server_side_http;
 
 pub mod http_header;
 
