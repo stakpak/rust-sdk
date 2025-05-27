@@ -1,15 +1,17 @@
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     num::ParseIntError,
     sync::Arc,
+    time::Duration,
 };
 
+use futures::Stream;
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
 
 use crate::{
@@ -21,14 +23,111 @@ use crate::{
     },
     transport::{
         WorkerTransport,
+        common::server_side_http::{SessionId, session_id},
         worker::{Worker, WorkerContext, WorkerQuitReason, WorkerSendRequest},
     },
 };
 
-#[derive(Debug, Clone)]
-pub struct ServerSessionMessage {
-    pub event_id: EventId,
-    pub message: Arc<ServerJsonRpcMessage>,
+#[derive(Debug, Default)]
+pub struct LocalSessionManager {
+    pub sessions: tokio::sync::RwLock<HashMap<SessionId, LocalSessionHandle>>,
+    pub session_config: SessionConfig,
+}
+
+#[derive(Debug, Error)]
+pub enum LocalSessionManagerError {
+    #[error("Session not found: {0}")]
+    SessionNotFound(SessionId),
+    #[error("Session error: {0}")]
+    SessionError(#[from] SessionError),
+    #[error("Invalid event id: {0}")]
+    InvalidEventId(#[from] EventIdParseError),
+}
+impl SessionManager for LocalSessionManager {
+    type Error = LocalSessionManagerError;
+    type Transport = WorkerTransport<LocalSessionWorker>;
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let id = session_id();
+        let (handle, worker) = create_local_session(id.clone(), self.session_config.clone());
+        self.sessions.write().await.insert(id.clone(), handle);
+        Ok((id, WorkerTransport::spawn(worker)))
+    }
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+        let response = handle.initialize(message).await?;
+        Ok(response)
+    }
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        let mut sessions = self.sessions.write().await;
+        if let Some(handle) = sessions.remove(id) {
+            handle.close().await?;
+        }
+        Ok(())
+    }
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        let sessions = self.sessions.read().await;
+        Ok(sessions.contains_key(id))
+    }
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+        let receiver = handle.establish_request_wise_channel().await?;
+        handle
+            .push_message(message, receiver.http_request_id)
+            .await?;
+        Ok(ReceiverStream::new(receiver.inner))
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+        let receiver = handle.establish_common_channel().await?;
+        Ok(ReceiverStream::new(receiver.inner))
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+        let receiver = handle.resume(last_event_id.parse()?).await?;
+        Ok(ReceiverStream::new(receiver.inner))
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+        handle.push_message(message, None).await?;
+        Ok(())
+    }
 }
 
 /// `<index>/request_id>`
@@ -80,17 +179,17 @@ impl std::str::FromStr for EventId {
     }
 }
 
-pub use crate::transport::common::axum::SessionId;
+use super::{ServerSseMessage, SessionManager};
 
 struct CachedTx {
-    tx: Sender<ServerSessionMessage>,
-    cache: VecDeque<ServerSessionMessage>,
+    tx: Sender<ServerSseMessage>,
+    cache: VecDeque<ServerSseMessage>,
     http_request_id: Option<HttpRequestId>,
     capacity: usize,
 }
 
 impl CachedTx {
-    fn new(tx: Sender<ServerSessionMessage>, http_request_id: Option<HttpRequestId>) -> Self {
+    fn new(tx: Sender<ServerSseMessage>, http_request_id: Option<HttpRequestId>) -> Self {
         Self {
             cache: VecDeque::with_capacity(tx.capacity()),
             capacity: tx.capacity(),
@@ -98,18 +197,26 @@ impl CachedTx {
             http_request_id,
         }
     }
-    fn new_common(tx: Sender<ServerSessionMessage>) -> Self {
+    fn new_common(tx: Sender<ServerSseMessage>) -> Self {
         Self::new(tx, None)
     }
 
     async fn send(&mut self, message: ServerJsonRpcMessage) {
-        let index = self.cache.back().map_or(0, |m| m.event_id.index + 1);
+        let index = self.cache.back().map_or(0, |m| {
+            m.event_id
+                .as_deref()
+                .unwrap_or_default()
+                .parse::<EventId>()
+                .expect("valid event id")
+                .index
+                + 1
+        });
         let event_id = EventId {
             http_request_id: self.http_request_id,
             index,
         };
-        let message = ServerSessionMessage {
-            event_id: event_id.clone(),
+        let message = ServerSseMessage {
+            event_id: Some(event_id.to_string()),
             message: Arc::new(message),
         };
         if self.cache.len() >= self.capacity {
@@ -120,7 +227,7 @@ impl CachedTx {
         }
         let _ = self.tx.send(message).await.inspect_err(|e| {
             let event_id = &e.0.event_id;
-            tracing::trace!(%event_id, "trying to send message in a closed session")
+            tracing::trace!(?event_id, "trying to send message in a closed session")
         });
     }
 
@@ -128,7 +235,12 @@ impl CachedTx {
         let Some(front) = self.cache.front() else {
             return Ok(());
         };
-        let sync_index = index.saturating_sub(front.event_id.index);
+        let front_event_id = front
+            .event_id
+            .as_deref()
+            .unwrap_or_default()
+            .parse::<EventId>()?;
+        let sync_index = index.saturating_sub(front_event_id.index);
         if sync_index > self.cache.len() {
             // invalid index
             return Err(SessionError::InvalidEventId);
@@ -136,9 +248,8 @@ impl CachedTx {
         for message in self.cache.iter().skip(sync_index) {
             let send_result = self.tx.send(message.clone()).await;
             if send_result.is_err() {
-                return Err(SessionError::ChannelClosed(
-                    message.event_id.http_request_id,
-                ));
+                let event_id: EventId = message.event_id.as_deref().unwrap_or_default().parse()?;
+                return Err(SessionError::ChannelClosed(Some(event_id.index as u64)));
             }
         }
         Ok(())
@@ -157,7 +268,7 @@ enum ResourceKey {
     ProgressToken(ProgressToken),
 }
 
-pub struct SessionWorker {
+pub struct LocalSessionWorker {
     id: SessionId,
     next_http_request_id: HttpRequestId,
     tx_router: HashMap<HttpRequestId, HttpRequestWise>,
@@ -167,7 +278,7 @@ pub struct SessionWorker {
     session_config: SessionConfig,
 }
 
-impl SessionWorker {
+impl LocalSessionWorker {
     pub fn id(&self) -> &SessionId {
         &self.id
     }
@@ -180,7 +291,7 @@ pub enum SessionError {
     #[error("Channel closed: {0:?}")]
     ChannelClosed(Option<HttpRequestId>),
     #[error("Cannot parse event id: {0}")]
-    EventIdParseError(Cow<'static, str>),
+    EventIdParseError(#[from] EventIdParseError),
     #[error("Session service terminated")]
     SessionServiceTerminated,
     #[error("Invalid event id")]
@@ -209,10 +320,10 @@ enum OutboundChannel {
 
 pub struct StreamableHttpMessageReceiver {
     pub http_request_id: Option<HttpRequestId>,
-    pub inner: Receiver<ServerSessionMessage>,
+    pub inner: Receiver<ServerSseMessage>,
 }
 
-impl SessionWorker {
+impl LocalSessionWorker {
     fn unregister_resource(&mut self, resource: &ResourceKey) {
         if let Some(http_request_id) = self.resource_router.remove(resource) {
             tracing::trace!(?resource, http_request_id, "unregister resource");
@@ -449,13 +560,13 @@ pub enum SessionQuitReason {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionHandle {
+pub struct LocalSessionHandle {
     id: SessionId,
     // after all event_tx drop, inner task will be terminated
     event_tx: Sender<SessionEvent>,
 }
 
-impl SessionHandle {
+impl LocalSessionHandle {
     /// Get the session id
     pub fn id(&self) -> &SessionId {
         &self.id
@@ -488,7 +599,7 @@ impl SessionHandle {
 
     /// establish a channel for a http-request, the corresponded message from server will be
     /// sent through this channel. The channel will be closed when the request is completed,
-    /// or you can close it manually by calling [`SessionHandle::close_request_wise_channel`].
+    /// or you can close it manually by calling [`LocalSessionHandle::close_request_wise_channel`].
     pub async fn establish_request_wise_channel(
         &self,
     ) -> Result<StreamableHttpMessageReceiver, SessionError> {
@@ -574,9 +685,9 @@ impl SessionHandle {
     }
 }
 
-pub type SessionTransport = WorkerTransport<SessionWorker>;
+pub type SessionTransport = WorkerTransport<LocalSessionWorker>;
 
-impl Worker for SessionWorker {
+impl Worker for LocalSessionWorker {
     type Error = SessionError;
     type Role = RoleServer;
     fn err_closed() -> Self::Error {
@@ -595,7 +706,7 @@ impl Worker for SessionWorker {
     async fn run(mut self, mut context: WorkerContext<Self>) -> Result<(), WorkerQuitReason> {
         enum InnerEvent {
             FromHttpService(SessionEvent),
-            FromHandler(WorkerSendRequest<SessionWorker>),
+            FromHandler(WorkerSendRequest<LocalSessionWorker>),
         }
         // waiting for initialize request
         let evt = self.event_rx.recv().await.ok_or_else(|| {
@@ -622,7 +733,9 @@ impl Worker for SessionWorker {
             .send(Ok(()))
             .map_err(|_| WorkerQuitReason::HandlerTerminated)?;
         let ct = context.cancellation_token.clone();
+        let keep_alive = self.session_config.keep_alive.unwrap_or(Duration::MAX);
         loop {
+            let keep_alive_timeout = tokio::time::sleep(keep_alive);
             let event = tokio::select! {
                 event = self.event_rx.recv() => {
                     if let Some(event) = event {
@@ -637,41 +750,34 @@ impl Worker for SessionWorker {
                 _ = ct.cancelled() => {
                     return Err(WorkerQuitReason::Cancelled)
                 }
+                _ = keep_alive_timeout => {
+                    return Err(WorkerQuitReason::fatal("keep live timeout", "poll next session event"))
+                }
             };
             match event {
                 InnerEvent::FromHandler(WorkerSendRequest { message, responder }) => {
                     // catch response
-                    match &message {
+                    let to_unregister = match &message {
                         crate::model::JsonRpcMessage::Response(json_rpc_response) => {
                             let request_id = json_rpc_response.id.clone();
-                            self.unregister_resource(&ResourceKey::McpRequestId(request_id));
+                            Some(ResourceKey::McpRequestId(request_id))
                         }
                         crate::model::JsonRpcMessage::Error(json_rpc_error) => {
                             let request_id = json_rpc_error.id.clone();
-                            self.unregister_resource(&ResourceKey::McpRequestId(request_id));
-                        }
-                        // unlikely happen
-                        crate::model::JsonRpcMessage::BatchResponse(
-                            json_rpc_batch_response_items,
-                        ) => {
-                            for item in json_rpc_batch_response_items {
-                                let request_id = match item {
-                                    crate::model::JsonRpcBatchResponseItem::Response(
-                                        json_rpc_response,
-                                    ) => json_rpc_response.id.clone(),
-                                    crate::model::JsonRpcBatchResponseItem::Error(
-                                        json_rpc_error,
-                                    ) => json_rpc_error.id.clone(),
-                                };
-                                self.unregister_resource(&ResourceKey::McpRequestId(request_id));
-                            }
+                            Some(ResourceKey::McpRequestId(request_id))
                         }
                         _ => {
+                            None
                             // no need to unregister resource
                         }
-                    }
+                    };
                     let handle_result = self.handle_server_message(message).await;
-                    let _ = responder.send(handle_result);
+                    let _ = responder.send(handle_result).inspect_err(|error| {
+                        tracing::warn!(?error, "failed to send message to http service handler");
+                    });
+                    if let Some(to_unregister) = to_unregister {
+                        self.unregister_resource(&to_unregister);
+                    }
                 }
                 InnerEvent::FromHttpService(SessionEvent::ClientMessage {
                     message: json_rpc_message,
@@ -737,7 +843,10 @@ impl Worker for SessionWorker {
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    channel_capacity: usize,
+    /// the capacity of the channel for the session. Default is 16.
+    pub channel_capacity: usize,
+    /// if set, the session will be closed after this duration of inactivity.
+    pub keep_alive: Option<Duration>,
 }
 
 impl SessionConfig {
@@ -748,29 +857,30 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             channel_capacity: Self::DEFAULT_CHANNEL_CAPACITY,
+            keep_alive: None,
         }
     }
 }
 
 /// Create a new session with the given id and configuration.
 ///
-/// This function will return a pair of [`SessionHandle`] and [`SessionWorker`].
+/// This function will return a pair of [`LocalSessionHandle`] and [`LocalSessionWorker`].
 ///
-/// You can run the [`SessionWorker`] as a transport for mcp server. And use the [`SessionHandle`] operate the session.
-pub fn create_session(
+/// You can run the [`LocalSessionWorker`] as a transport for mcp server. And use the [`LocalSessionHandle`] operate the session.
+pub fn create_local_session(
     id: impl Into<SessionId>,
     config: SessionConfig,
-) -> (SessionHandle, SessionWorker) {
+) -> (LocalSessionHandle, LocalSessionWorker) {
     let id = id.into();
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(config.channel_capacity);
     let (common_tx, _) = tokio::sync::mpsc::channel(config.channel_capacity);
     let common = CachedTx::new_common(common_tx);
     tracing::info!(session_id = ?id, "create new session");
-    let handle = SessionHandle {
+    let handle = LocalSessionHandle {
         event_tx,
         id: id.clone(),
     };
-    let session_worker = SessionWorker {
+    let session_worker = LocalSessionWorker {
         next_http_request_id: 0,
         id,
         tx_router: HashMap::new(),
