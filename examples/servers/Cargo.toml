@@ -13,14 +13,14 @@ rmcp = { path = "../../crates/rmcp", features = [
     "transport-io",
     "transport-streamable-http-server",
     "auth",
-]}
+] }
 tokio = { version = "1", features = [
     "macros",
     "rt",
     "rt-multi-thread",
     "io-std",
     "signal",
-]}
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -42,7 +42,6 @@ askama = { version = "0.14" }
 tower-http = { version = "0.6", features = ["cors"] }
 hyper = { version = "1" }
 hyper-util = { version = "0", features = ["server"] }
-
 
 [dev-dependencies]
 tokio-stream = { version = "0.1" }

@@ -7,7 +7,7 @@
 //! | transport         | client                                                    | server                                                |
 //! |:-:                |:-:                                                        |:-:                                                    |
 //! | std IO            | [`child_process::TokioChildProcess`]                      | [`io::stdio`]                                         |
-//! | streamable http   | [`streamable_http_client::StreamableHttpClientTransport`] | [`streamable_http_server::StreamableHttpService`]   |
+//! | streamable http   | [`streamable_http_client::StreamableHttpClientTransport`] | [`streamable_http_server::StreamableHttpService`]     |
 //! | sse               | [`sse_client::SseClientTransport`]                        | [`sse_server::SseServer`]                             |
 //!
 //！## Helper Transport Types

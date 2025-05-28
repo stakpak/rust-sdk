@@ -21,15 +21,16 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-        let service = StreamableHttpService::new(
-            Counter::new,
-            LocalSessionManager::default().into(),
-            Default::default(),
-        );
-        let router = axum::Router::new().nest_service("/mcp", service);
-        let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-        let _ = axum::serve(tcp_listener, router)
-            .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
-            .await;
+    let service = StreamableHttpService::new(
+        Counter::new,
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
+    let _ = axum::serve(tcp_listener, router)
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
+        .await;
     Ok(())
 }
